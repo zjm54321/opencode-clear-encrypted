@@ -1,0 +1,25 @@
+{
+  "name": "opencode-clear-encrypted",
+  "version": "0.1.0",
+  "description": "Local OpenCode command to back up and clear invalid encrypted reasoning context while retaining chat history",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.ts",
+    "./rpc": "./src/rpc.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test"
+  },
+  "license": "GPL-3.0-or-later",
+  "repository": "github:zjm54321/opencode-clear-encrypted",
+  "bugs": {
+    "url": "https://github.com/zjm54321/opencode-clear-encrypted/issues"
+  },
+  "homepage": "https://github.com/zjm54321/opencode-clear-encrypted#readme"
+}
