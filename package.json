@@ -1,6 +1,6 @@
 {
   "name": "opencode-clear-encrypted",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local OpenCode command to back up and clear invalid encrypted reasoning context while retaining chat history",
   "type": "module",
   "exports": {
