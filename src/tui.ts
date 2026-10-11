@@ -4,7 +4,7 @@ import { definition, id, reasons, safeReason, type ClearResult } from "./rpc"
 type Location = { directory: string; workspaceID?: string }
 export interface TuiContext {
   app: { version: string }
-  keymap: { layer(factory: () => { commands: { id: string; title: string; slash: { name: string; arguments: true }; run(input?: string): Promise<void> }[] }): void }
+  keymap: { layer(factory: () => { mode: "global"; commands: { id: string; title: string; palette: true; slash: { name: string; arguments: true }; run(input?: string): Promise<void> }[] }): void }
   ui: {
     router: { current(): { type: string; sessionID?: string } }
     toast: { show(input: { message: string; variant: "info" | "success" | "error"; sessionID?: string }): void }
@@ -22,10 +22,12 @@ export default {
     if (typeof ctx?.keymap?.layer !== "function") throw new Error(reasons.compatibility)
     const pending = new Set<string>()
     ctx.keymap.layer(() => ({
+      mode: "global",
       // ALWAYS registered: disabling it could let typed slash text reach the model.
       commands: [{
         id,
         title: "清理当前会话的加密推理上下文",
+        palette: true,
         slash: { name: id, arguments: true },
         async run(input?: string) {
           // Missing operational APIs must not prevent registration/consume of this slash.

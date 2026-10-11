@@ -19,6 +19,7 @@ function replace(ctx: object, keys: string[], value: unknown) {
 }
 
 function tui(configure: (ctx: TuiContext) => void = () => {}) {
+  let layer!: ReturnType<Parameters<TuiContext["keymap"]["layer"]>[0]>
   let command!: ReturnType<Parameters<TuiContext["keymap"]["layer"]>[0]>["commands"][number]
   let route: { type: string; sessionID?: string } = { type: "session", sessionID: "ses_current" }
   const location = { directory: "/tmp/opencode/current", workspaceID: "wrk_current" }
@@ -29,7 +30,7 @@ function tui(configure: (ctx: TuiContext) => void = () => {}) {
   const reply = deferred<unknown>()
   const ctx: TuiContext = {
     app: { version: "2.0.26+9b4ec57" },
-    keymap: { layer(factory) { command = factory().commands[0] } },
+    keymap: { layer(factory) { layer = factory(); command = layer.commands[0] } },
     ui: { router: { current: () => route }, toast: { show: ({ message }) => { toasts.push(message) } } },
     data: { session: { get: () => ({ location }), message: {
       invalidate: (id) => { messages.push(["invalidate", id]) },
@@ -41,13 +42,15 @@ function tui(configure: (ctx: TuiContext) => void = () => {}) {
   }
   configure(ctx)
   plugin.setup(ctx)
-  return { ctx, command, location, toasts, calls, factories, messages, reply, route: (next: typeof route) => { route = next } }
+  return { ctx, layer, command, location, toasts, calls, factories, messages, reply, route: (next: typeof route) => { route = next } }
 }
 
 describe("local slash wiring", () => {
   test("always registered; typed empty input captures session and copied location before await", async () => {
     const ui = tui()
+    expect(ui.layer.mode).toBe("global")
     expect(ui.command.id).toBe("clear-encrypted")
+    expect(ui.command.palette).toBe(true)
     expect(ui.command.slash).toEqual({ name: "clear-encrypted", arguments: true })
     expect("enabled" in ui.command).toBe(false)
     const task = ui.command.run("")
@@ -90,6 +93,8 @@ describe("local slash wiring", () => {
     ["client"], ["client", "rpc"],
   ]) for (const value of [undefined, "not callable"]) test(`missing/noncallable ${keys.join(".")} (${String(value)}): registered, local refusal before RPC`, async () => {
     const ui = tui((ctx) => replace(ctx, keys, value))
+    expect(ui.layer.mode).toBe("global")
+    expect(ui.command.palette).toBe(true)
     expect(ui.command.slash).toEqual({ name: "clear-encrypted", arguments: true })
     expect("enabled" in ui.command).toBe(false)
     if (typeof ui.ctx.ui?.toast?.show !== "function") await expect(ui.command.run()).rejects.toThrow(reasons.compatibility)
