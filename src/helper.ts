@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { Database } from "bun:sqlite"
-import { createHash, randomUUID } from "node:crypto"
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { join } from "node:path"
 
 export type Request = { operation: "clear" | "restore"; dbPath: string; sessionID: string; directory: string; backupDir?: string; backupPath?: string }
-type Result = { ok: true; changedMessages: number; changedEvents: number; removedFields: number; backupPath?: string } | { ok: false; error: string }
+type Result = { ok: true; changedMessages: number; changedEvents: number; removedFields: number } | { ok: false; error: string }
 type ObjectValue = Record<string, any>
 type Row = { id: string; type: string; data: string; [key: string]: unknown }
 type Change = { table: "session_message" | "event"; id: string; original: string; cleaned: string; removedFields: number }
@@ -219,25 +219,9 @@ function plan(db: Database, state: ReturnType<typeof snapshot>): Change[] {
   }
   return changes
 }
-function postState(state: ReturnType<typeof snapshot>, changes: Change[]) {
-  return { ...state, messages: state.messages.map(row => ({ ...row, data: changes.find(c => c.table === "session_message" && c.id === row.id)?.cleaned ?? row.data })), events: state.events.map(row => ({ ...row, data: changes.find(c => c.table === "event" && c.id === row.id)?.cleaned ?? row.data })) }
-}
 function privateStat(path: string, directory: boolean) {
   const stat = lstatSync(path)
   requireSafe((directory ? stat.isDirectory() : stat.isFile()) && stat.uid === process.getuid!() && (stat.mode & 0o777) === (directory ? 0o700 : 0o600), "Backup must be private and owned by the current user")
-}
-function writeBackup(directory: string, value: unknown) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 })
-  privateStat(directory, true)
-  const canonical = realpathSync(directory)
-  const path = join(canonical, `clear-encrypted-${randomUUID()}.json`)
-  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-  try { writeFileSync(fd, encode(value)); fsyncSync(fd) } finally { closeSync(fd) }
-  for (const dir of [canonical, join(canonical, "..")]) {
-    const dfd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY)
-    try { fsyncSync(dfd) } finally { closeSync(dfd) }
-  }
-  return path
 }
 function readBackup(path: string) {
   privateStat(path, false)
@@ -255,14 +239,15 @@ export function runCleanup(input: unknown): Result {
   let transaction = false
   try {
     requireSafe(object(input) && ["clear", "restore"].includes(input.operation), "Invalid operation")
-    for (const key of ["dbPath", "sessionID", "directory", input.operation === "clear" ? "backupDir" : "backupPath"]) requireSafe(typeof input[key] === "string" && input[key].length > 0, "Missing request identity or backup path")
+    for (const key of ["dbPath", "sessionID", "directory"]) requireSafe(typeof input[key] === "string" && input[key].length > 0, "Missing request identity")
+    if (input.operation === "restore") requireSafe(typeof input.backupPath === "string" && input.backupPath.length > 0, "Missing backup path")
     const request = input as Request
     const dbPath = realpathSync(request.dbPath)
     const directory = realpathSync(request.directory)
     const stat = statSync(dbPath, { bigint: true })
     requireSafe(stat.isFile() && statSync(directory).isDirectory(), "Invalid database or directory")
     const identity = { dbPath, directory, sessionID: request.sessionID, device: stat.dev.toString(), inode: stat.ino.toString() }
-    // Restore filesystem reads and all backup I/O stay outside the writer lock.
+    // Restore filesystem reads stay outside the writer lock.
     const backup = request.operation === "restore" ? readBackup(request.backupPath!) : undefined
     db = new Database(dbPath, { create: false, strict: true, safeIntegers: true })
     db.exec("PRAGMA busy_timeout = 1000; PRAGMA trusted_schema = OFF; PRAGMA synchronous = FULL; BEGIN")
@@ -271,7 +256,6 @@ export function runCleanup(input: unknown): Result {
     const state = snapshot(db, request.sessionID)
     guard(db, request, state, directory)
     let changes: Change[]
-    let backupPath: string | undefined
     if (request.operation === "clear") {
       changes = plan(db, state)
     } else {
@@ -293,8 +277,7 @@ export function runCleanup(input: unknown): Result {
     db.exec("COMMIT")
     transaction = false
     if (changes.length) {
-      if (request.operation === "clear") backupPath = writeBackup(request.backupDir!, { version: 1, identity, watermark: encode(state.sequence), postDigest: digest(postState(state, changes)), changes })
-      // Work may have been admitted while planning/backing up. Never interrupt
+      // Work may have been admitted while planning. Never interrupt
       // again: acquire the short writer lock, repeat every guard, then compare.
       db.exec("BEGIN IMMEDIATE")
       transaction = true
@@ -310,10 +293,10 @@ export function runCleanup(input: unknown): Result {
       db.exec("COMMIT")
       transaction = false
     }
-    return { ok: true, changedMessages: changes.filter(c => c.table === "session_message").length, changedEvents: changes.filter(c => c.table === "event").length, removedFields: changes.reduce((n, c) => n + c.removedFields, 0), ...(backupPath ? { backupPath } : {}) }
+    return { ok: true, changedMessages: changes.filter(c => c.table === "session_message").length, changedEvents: changes.filter(c => c.table === "event").length, removedFields: changes.reduce((n, c) => n + c.removedFields, 0) }
   } catch (error) {
     // SQLite/filesystem/JSON errors may contain history or paths: never echo them.
-    return { ok: false, error: error instanceof Refusal ? error.message : "Cleanup failed: database, backup, or filesystem operation unavailable" }
+    return { ok: false, error: error instanceof Refusal ? error.message : "Cleanup failed: database or filesystem operation unavailable" }
   } finally {
     if (transaction) { try { db?.exec("ROLLBACK") } catch {} }
     db?.close()

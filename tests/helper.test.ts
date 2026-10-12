@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import * as fs from "node:fs"
 import { runCleanup } from "../src/helper"
 
 const roots: string[] = []
@@ -45,7 +45,7 @@ function fixture() {
     const identity = ["session.reasoning.started.1", "session.reasoning.ended.1"].includes(type) ? { assistantMessageID: "m", ordinal: 0, ...(type === "session.reasoning.ended.1" ? { text: "reasoning" } : {}) } : {}
     return db.query("INSERT INTO event VALUES (?, ?, ?, 3, ?, ?)").run(id, session, seq, type, JSON.stringify({ ...identity, ...(data as object) }))
   }
-  const request = { operation: "clear" as const, dbPath, sessionID: "target", directory, backupDir: join(root, "backups") }
+  const request = { operation: "clear" as const, dbPath, sessionID: "target", directory }
   const snapshot = () => JSON.stringify(["session_v2", "session_message", "event", "event_sequence", "session_pending", "session_inbox"].map(table => db.query(`SELECT * FROM ${table} ORDER BY 1`).all()))
   const data = (table: string, id: string) => JSON.parse((db.query(`SELECT data FROM ${table} WHERE id = ?`).get(id) as { data: string }).data)
   return { root, db, message, event, request, snapshot, data }
@@ -58,7 +58,86 @@ const context = () => ({ version: 1, provenance: { providerID: "openai", provide
   { type: "compaction", encrypted: "native-checkpoint", providerMetadata: { openai: { itemId: "native-id" } } },
 ] }] })
 
+// Synthetic legacy v1 backup and matching post-cleanup database. This does not
+// call production cleanup or depend on any real backup/history files.
+function legacyFixture(f: ReturnType<typeof fixture>) {
+  const original = '{"time":{"created":1,"completed":2},"huge":9007199254740993123,"content":[{"type":"reasoning","text":"readable reasoning","state":{"reasoningEncryptedContent":"secret","itemId":"reason-1"}}]}'
+  const cleaned = '{"time":{"created":1,"completed":2},"huge":9007199254740993123,"content":[{"type":"reasoning","text":"readable reasoning"}]}'
+  f.message("m", "assistant", original)
+  f.event("end", "session.reasoning.ended.1", { sessionID: "target", state: { reasoningEncryptedContent: "event-secret", itemId: "reason-1" } })
+  const before = f.snapshot()
+  const eventOriginal = (f.db.query("SELECT data FROM event WHERE id = 'end'").get() as { data: string }).data
+  const eventCleaned = JSON.stringify({ assistantMessageID: "m", ordinal: 0, text: "reasoning", sessionID: "target" })
+  const changes = [
+    { table: "session_message", id: "m", original, cleaned, removedFields: 2 },
+    { table: "event", id: "end", original: eventOriginal, cleaned: eventCleaned, removedFields: 2 },
+  ]
+  for (const c of changes) f.db.query(`UPDATE ${c.table} SET data = ? WHERE id = ?`).run(c.cleaned, c.id)
+  const db = new Database(f.request.dbPath, { create: false, strict: true, safeIntegers: true })
+  try {
+    const state = {
+      session: db.query("SELECT * FROM session_v2 WHERE id = ?").get("target"),
+      sequence: db.query("SELECT * FROM event_sequence WHERE aggregate_id = ?").get("target"),
+      messages: db.query("SELECT * FROM session_message WHERE session_id = ? ORDER BY seq, id").all("target"),
+      events: db.query("SELECT * FROM event WHERE aggregate_id = ? ORDER BY seq, id").all("target"),
+    }
+    const encode = (value: unknown) => JSON.stringify(value, (_, v) => typeof v === "bigint" ? { sqliteInteger: v.toString() } : v)
+    const stat = statSync(f.request.dbPath, { bigint: true })
+    const identity = { dbPath: realpathSync(f.request.dbPath), directory: realpathSync(f.request.directory), sessionID: "target", device: stat.dev.toString(), inode: stat.ino.toString() }
+    const backupDir = join(f.root, "legacy-backups")
+    mkdirSync(backupDir, { mode: 0o700 })
+    const backupPath = join(backupDir, "legacy-v1.json")
+    writeFileSync(backupPath, encode({ version: 1, identity, watermark: encode(state.sequence), postDigest: createHash("sha256").update(encode(state)).digest("hex"), changes }), { mode: 0o600 })
+    return { backupPath, before }
+  } finally { db.close() }
+}
+
 describe("bounded current-session cleanup", () => {
+  test("changed clear needs no backup directory and creates no backup files", () => {
+    const f = fixture()
+    try {
+      f.message("m", "assistant", assistant())
+      const files = readdirSync(f.root, { recursive: true }).sort()
+      expect(runCleanup(f.request)).toEqual({ ok: true, changedMessages: 1, changedEvents: 0, removedFields: 2 })
+      expect(f.data("session_message", "m").content[0].state).toBeUndefined()
+      expect(readdirSync(f.root, { recursive: true }).sort()).toEqual(files)
+      // A no-op likewise needs no backup directory and creates nothing.
+      expect(runCleanup(f.request)).toEqual({ ok: true, changedMessages: 0, changedEvents: 0, removedFields: 0 })
+      expect(readdirSync(f.root, { recursive: true }).sort()).toEqual(files)
+    } finally { f.db.close() }
+  })
+
+  test("clear ignores legacy backup paths and preserves existing backup files", () => {
+    for (const kind of ["absent", "not-directory", "existing"]) {
+      const f = fixture()
+      try {
+        f.message("m", "assistant", assistant())
+        const backupDir = kind === "not-directory" ? f.request.dbPath : join(f.root, "backups")
+        const oldPath = join(backupDir, "old-v1.json")
+        if (kind === "existing") {
+          mkdirSync(backupDir, { mode: 0o755 }) // clear must not enforce backup permissions
+          writeFileSync(oldPath, "synthetic old backup must remain untouched")
+        }
+        const files = readdirSync(f.root, { recursive: true }).sort()
+        expect(runCleanup({ ...f.request, backupDir, backupPath: oldPath })).toEqual({ ok: true, changedMessages: 1, changedEvents: 0, removedFields: 2 })
+        expect(readdirSync(f.root, { recursive: true }).sort()).toEqual(files)
+        if (kind === "existing") expect(readFileSync(oldPath, "utf8")).toBe("synthetic old backup must remain untouched")
+      } finally { f.db.close() }
+    }
+  })
+
+  test("manual restore of a private legacy v1 backup restores exact raw rows", () => {
+    const f = fixture()
+    try {
+      const { backupPath, before } = legacyFixture(f)
+      const backup = readFileSync(backupPath)
+      expect(runCleanup({ ...f.request, operation: "restore", backupPath })).toEqual({ ok: true, changedMessages: 1, changedEvents: 1, removedFields: 4 })
+      expect(f.snapshot()).toBe(before)
+      expect((f.db.query("SELECT data FROM session_message WHERE id = 'm'").get() as any).data).toContain('"huge":9007199254740993123')
+      expect(readFileSync(backupPath)).toEqual(backup)
+    } finally { f.db.close() }
+  })
+
   test("correlation is limited to the owning message and provider namespace", () => {
     const f = fixture()
     try {
@@ -74,7 +153,6 @@ describe("bounded current-session cleanup", () => {
       const separate = context()
       delete (separate.messages[0].content[0] as any).providerMetadata.openai.reasoningEncryptedContent
       f.message("other-compact", "compaction", { status: "completed", providerContext: separate }, "target", 4)
-      const before = f.snapshot()
       const result = runCleanup(f.request)
       expect(result.ok).toBe(true)
       if (!result.ok) throw Error(result.error)
@@ -88,8 +166,6 @@ describe("bounded current-session cleanup", () => {
       expect(cleaned[0].content[1].providerMetadata).toEqual({ anthropic: { signature: "keep" } })
       expect(cleaned[1].content[0].providerMetadata.openai.itemId).toBe("context-1")
       expect(f.data("session_message", "other-compact").providerContext).toEqual(separate)
-      expect(runCleanup({ ...f.request, operation: "restore", backupPath: result.backupPath }).ok).toBe(true)
-      expect(f.snapshot()).toBe(before)
     } finally { f.db.close() }
   })
 
@@ -103,7 +179,6 @@ describe("bounded current-session cleanup", () => {
       f.message("m", "assistant", `${terminal},"error":{"data":${example}},"providerState":${example},"metadata":${example}}`, "target", 2)
       f.message("tool", "assistant", `{"time":{"completed":2},"content":[{"type":"tool","state":{"status":"completed","input":${example},"content":[{"type":"text","text":"tool"}]}}]}`, "target", 3)
       f.event("error", "session.error.1", { sessionID: "target", error: { data: { reasoningEncryptedContent: "not reasoning state" } } })
-      const before = f.snapshot()
       const result = runCleanup(f.request)
       expect(result.ok).toBe(true)
       if (!result.ok) throw Error(result.error)
@@ -114,8 +189,6 @@ describe("bounded current-session cleanup", () => {
       expect(raw).toContain(`"metadata":${example}`)
       expect(raw).toContain(`"error":{"data":${example}}`)
       expect(f.data("session_message", "m").content[0].state).toBeUndefined()
-      expect(runCleanup({ ...f.request, operation: "restore", backupPath: result.backupPath }).ok).toBe(true)
-      expect(f.snapshot()).toBe(before)
     } finally { f.db.close() }
   })
 
@@ -131,17 +204,21 @@ describe("bounded current-session cleanup", () => {
     } finally { f.db.close() }
   })
 
-  test("backup releases database locks; intervening changes or admissions fail final recheck", () => {
+  test("read COMMIT releases locks; intervening changes or admissions fail final recheck", () => {
     for (const mutation of ["other-only", "target", "pending", "inbox", "fork", "owner"]) {
       const f = fixture()
-      let sync: ReturnType<typeof spyOn> | undefined
+      let execSpy: ReturnType<typeof spyOn> | undefined
       try {
         f.message("m", "assistant", assistant())
         const original = (f.db.query("SELECT data FROM session_message WHERE id = 'm'").get() as any).data
-        const fsync = fs.fsyncSync
+        const exec = Database.prototype.exec
+        const files = readdirSync(f.root, { recursive: true }).sort()
         let wrote = false
-        sync = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-          if (!wrote && fs.fstatSync(fd).isFile()) {
+        let intervening: string | undefined
+        execSpy = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, ...args: Parameters<Database["exec"]>) {
+          const result = exec.apply(this, args)
+          if (!wrote && this !== f.db && args[0] === "COMMIT") {
+            wrote = true // guard recursive exec calls from the injected writer
             // This is a separate connection from the helper, in rollback-journal
             // mode: both a lingering read lock and a writer lock prevent commit.
             f.db.exec("PRAGMA busy_timeout = 0; UPDATE session_v2 SET title = 'independent writer' WHERE id = 'other'")
@@ -150,21 +227,24 @@ describe("bounded current-session cleanup", () => {
             if (mutation === "inbox") f.db.exec("INSERT INTO session_inbox VALUES ('new', 'target', 'user', '{}', 'next', 21, 4)")
             if (mutation === "fork") f.db.exec("UPDATE session_v2 SET fork_session_id = 'target' WHERE id = 'other'")
             if (mutation === "owner") f.db.exec("UPDATE event_sequence SET owner_id = 'replica' WHERE aggregate_id = 'target'")
-            wrote = true
+            intervening = f.snapshot()
           }
-          fsync(fd)
+          return result
         })
         const result = runCleanup(f.request)
         expect(wrote).toBe(true)
         expect(result.ok).toBe(mutation === "other-only")
         expect((f.db.query("SELECT title FROM session_v2 WHERE id = 'other'").get() as any).title).toBe("independent writer")
-        if (mutation !== "other-only") expect((f.db.query("SELECT data FROM session_message WHERE id = 'm'").get() as any).data).toBe(original)
-        expect(readdirSync(f.request.backupDir)).toHaveLength(1)
-      } finally { sync?.mockRestore(); f.db.close() }
+        if (mutation !== "other-only") {
+          expect((f.db.query("SELECT data FROM session_message WHERE id = 'm'").get() as any).data).toBe(original)
+          expect(f.snapshot()).toBe(intervening)
+        } else expect(f.data("session_message", "m").content[0].state).toBeUndefined()
+        expect(readdirSync(f.root, { recursive: true }).sort()).toEqual(files)
+      } finally { execSpy?.mockRestore(); f.db.close() }
     }
   })
 
-  test("cleans all native/event/context targets, keeps other content and restores exact raw rows", () => {
+  test("cleans all native/event/context targets and keeps other content and integer precision", () => {
     const f = fixture()
     try {
       f.db.query("UPDATE session_v2 SET parent_id = 'parent' WHERE id = 'target'").run() // not a fork
@@ -184,8 +264,6 @@ describe("bounded current-session cleanup", () => {
       expect(result.changedMessages).toBe(2)
       expect(result.changedEvents).toBe(4)
       expect(result.removedFields).toBe(13)
-      expect(statSync(result.backupPath!).mode & 0o777).toBe(0o600)
-      expect(statSync(f.request.backupDir).mode & 0o777).toBe(0o700)
       const old = f.data("session_message", "old")
       expect(old.content[0].state).toBeUndefined()
       expect(old.content[0].text).toBe("readable reasoning")
@@ -212,14 +290,11 @@ describe("bounded current-session cleanup", () => {
       }))
       expect(withoutData(f.snapshot())).toEqual(withoutData(before))
       expect(runCleanup(f.request)).toEqual({ ok: true, changedMessages: 0, changedEvents: 0, removedFields: 0 })
-      expect(readdirSync(f.request.backupDir)).toHaveLength(1)
-      const restored = runCleanup({ ...f.request, operation: "restore", backupPath: result.backupPath })
-      expect(restored.ok).toBe(true)
-      expect(f.snapshot()).toBe(before)
+      expect(readdirSync(f.root)).not.toContain("backups")
     } finally { f.db.close() }
   })
 
-  for (const kind of ["active", "compacting", "pending", "inbox", "unfinished", "tool", "missing-reasoning-owner", "compaction", "fork", "fork-child", "owned", "no-sequence", "schema", "trigger", "directory", "unknown", "duplicate", "event-identity", "future-event", "backup-failure"]) {
+  for (const kind of ["active", "compacting", "pending", "inbox", "unfinished", "tool", "missing-reasoning-owner", "compaction", "fork", "fork-child", "owned", "no-sequence", "schema", "trigger", "directory", "unknown", "duplicate", "event-identity", "future-event"]) {
     test(`refuses ${kind} without mutating any rows`, () => {
       const f = fixture()
       try {
@@ -243,7 +318,6 @@ describe("bounded current-session cleanup", () => {
         if (kind === "duplicate") f.db.query("UPDATE session_message SET data = ?").run('{"time":{"completed":2},"content":[],"content":[{"type":"reasoning","state":{"reasoningEncryptedContent":"hidden"}}]}')
         if (kind === "event-identity") f.event("bad", "session.reasoning.ended.1", { sessionID: "other", state: { reasoningEncryptedContent: "secret" } })
         if (kind === "future-event") f.event("bad", "session.reasoning.ended.1", { sessionID: "target", state: { reasoningEncryptedContent: "secret" } }, "target", 21)
-        if (kind === "backup-failure") f.request.backupDir = f.request.dbPath
         const before = f.snapshot()
         expect(runCleanup(f.request).ok).toBe(false)
         expect(f.snapshot()).toBe(before)
@@ -251,14 +325,11 @@ describe("bounded current-session cleanup", () => {
     })
   }
 
-  for (const conflict of ["watermark", "postimage", "timestamp", "new-message", "identity", "busy", "owned", "fork", "tampered-backup"]) {
+  for (const conflict of ["watermark", "postimage", "timestamp", "new-message", "identity", "busy", "owned", "fork", "tampered-backup", "private-file", "private-directory"]) {
     test(`restore fails closed on ${conflict}`, () => {
       const f = fixture()
       try {
-        f.message("m", "assistant", assistant())
-        const result = runCleanup(f.request)
-        expect(result.ok).toBe(true)
-        if (!result.ok) throw Error(result.error)
+        const { backupPath } = legacyFixture(f)
         if (conflict === "watermark") f.db.exec("UPDATE event_sequence SET seq = 21 WHERE aggregate_id = 'target'")
         if (conflict === "postimage") f.db.exec("UPDATE session_message SET data = json_set(data, '$.content[0].text', 'new') WHERE id = 'm'")
         if (conflict === "timestamp") f.db.exec("UPDATE session_message SET time_updated = 999 WHERE id = 'm'")
@@ -268,12 +339,14 @@ describe("bounded current-session cleanup", () => {
         if (conflict === "owned") f.db.exec("UPDATE event_sequence SET owner_id = 'replica' WHERE aggregate_id = 'target'")
         if (conflict === "fork") f.db.exec("UPDATE session_v2 SET fork_session_id = 'target' WHERE id = 'other'")
         if (conflict === "tampered-backup") {
-          const backup = JSON.parse(readFileSync(result.backupPath!, "utf8"))
+          const backup = JSON.parse(readFileSync(backupPath, "utf8"))
           backup.changes[0].original = backup.changes[0].original.replace("readable reasoning", "altered readable reasoning")
-          writeFileSync(result.backupPath!, JSON.stringify(backup))
+          writeFileSync(backupPath, JSON.stringify(backup))
         }
+        if (conflict === "private-file") chmodSync(backupPath, 0o644)
+        if (conflict === "private-directory") chmodSync(join(backupPath, ".."), 0o755)
         const before = f.snapshot()
-        expect(runCleanup({ ...f.request, operation: "restore", backupPath: result.backupPath }).ok).toBe(false)
+        expect(runCleanup({ ...f.request, operation: "restore", backupPath }).ok).toBe(false)
         expect(f.snapshot()).toBe(before)
       } finally { f.db.close() }
     })
@@ -298,23 +371,19 @@ describe("bounded current-session cleanup", () => {
     } finally { f.db.close() }
   })
 
-  test("private backup is required, and failure after backup rolls back all updates", () => {
+  test("failure after a partial UPDATE rolls back all updates without creating backups", () => {
     const f = fixture()
     try {
       f.message("m", "assistant", assistant())
-      mkdirSync(f.request.backupDir, { mode: 0o755 })
-      const before = f.snapshot()
-      expect(runCleanup(f.request).ok).toBe(false)
-      expect(f.snapshot()).toBe(before)
-      rmSync(f.request.backupDir, { recursive: true })
       // Preserve pinned columns but force an UPDATE failure via a fixture-only
       // constraint, after the first message UPDATE has succeeded.
       f.db.exec("DROP TABLE event; CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, created integer NOT NULL DEFAULT 0, type text NOT NULL, data text NOT NULL CHECK (instr(data, 'reasoningEncryptedContent') > 0))")
       f.event("fail", "session.reasoning.ended.1", { sessionID: "target", state: { reasoningEncryptedContent: "event-secret", itemId: "reason-1" } })
       const beforeUpdate = f.snapshot()
+      const files = readdirSync(f.root, { recursive: true }).sort()
       expect(runCleanup(f.request).ok).toBe(false)
       expect(f.snapshot()).toBe(beforeUpdate)
-      expect(readdirSync(f.request.backupDir)).toHaveLength(1)
+      expect(readdirSync(f.root, { recursive: true }).sort()).toEqual(files)
     } finally { f.db.close() }
   })
 

@@ -53,21 +53,21 @@ export default {
             return toast(`清理未完成：${reasons.location}`, "error")
           if (pending.has(sessionID)) return toast(`清理未完成：${reasons.busy}`, "error")
           pending.add(sessionID)
-          toast("正在停止当前会话并备份加密上下文…", "info")
+          toast("正在停止当前会话并清理加密推理上下文。", "info")
           try {
             const rpc = ctx.client.rpc(definition)
             if (typeof rpc?.clear !== "function") throw new Error(reasons.compatibility)
             const committed = await rpc.clear({ sessionID }, { location }) as ClearResult
             toast(committed.removedFields === 0
               ? "当前会话没有可清理的加密推理字段"
-              : `已清理加密推理上下文，聊天记录已保留。\n消息 ${committed.changedMessages}，事件 ${committed.changedEvents}，字段 ${committed.removedFields}\n备份：${committed.backupPath ?? "未返回路径"}`, "success")
+              : `已清理加密推理上下文，聊天记录已保留。\n消息 ${committed.changedMessages}，事件 ${committed.changedEvents}，字段 ${committed.removedFields}`, "success")
             // Refresh is best-effort: a stalled sync must not hide the confirmed
-            // commit/backup or keep this command pending. Capture this result/session.
+            // commit or keep this command pending. Capture this result/session.
             void Promise.resolve().then(async () => {
               ctx.data.session.message.invalidate(sessionID)
               await ctx.data.session.message.sync(sessionID)
             }).catch(() => {
-              toast(`${reasons.refresh}${committed.backupPath ? `\n备份：${committed.backupPath}` : ""}`, "error")
+              toast(reasons.refresh, "error")
             })
           } catch (error) {
             toast(`清理未完成：${safeReason(error)}`, "error")

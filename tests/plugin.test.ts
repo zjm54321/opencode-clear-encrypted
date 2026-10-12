@@ -4,7 +4,7 @@ import plugin, { type TuiContext } from "../src/tui"
 import { databasePath, runHelper, setupServer, type Dependencies, type ServerContext } from "../src/index"
 import { definition, reasons } from "../src/rpc"
 
-const success = { ok: true as const, changedMessages: 2, changedEvents: 3, removedFields: 4, backupPath: "/tmp/opencode/synthetic-backup.json" }
+const success = { ok: true as const, changedMessages: 2, changedEvents: 3, removedFields: 4 }
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (error: unknown) => void
@@ -60,9 +60,10 @@ describe("local slash wiring", () => {
     await task
     expect(ui.calls).toEqual([{ input: { sessionID: "ses_current" }, options: { location: { directory: "/tmp/opencode/current", workspaceID: "wrk_current" } } }])
     expect(ui.messages).toEqual([["invalidate", "ses_current"], ["sync", "ses_current"]])
-    expect(ui.toasts[0]).toBe("正在停止当前会话并备份加密上下文…")
+    expect(ui.toasts[0]).toBe("正在停止当前会话并清理加密推理上下文。")
     expect(ui.toasts[1]).toContain("已清理加密推理上下文，聊天记录已保留。")
-    expect(ui.toasts[1]).toContain(success.backupPath)
+    expect(ui.toasts[1]).toContain("消息 2，事件 3，字段 4")
+    expect(ui.toasts.join("\n")).not.toContain("备份")
     // The mock intentionally exposes no prompt, generation, composer or model API.
   })
 
@@ -131,7 +132,7 @@ describe("local slash wiring", () => {
     expect(ui.toasts.at(-1)).toBe("当前会话没有可清理的加密推理字段")
   })
 
-  for (const failure of ["invalidate", "sync-throw", "sync-reject"] as const) test(`${failure} after commit reports commit, retains backup path`, async () => {
+  for (const failure of ["invalidate", "sync-throw", "sync-reject"] as const) test(`${failure} after commit reports commit without backup claims`, async () => {
     const ui = tui()
     const notified = deferred<void>()
     const show = ui.ctx.ui.toast.show
@@ -147,8 +148,8 @@ describe("local slash wiring", () => {
     // Wait for the detached refresh's notification microtask, without timers/polling.
     await notified.promise
     expect(ui.toasts[1]).toContain("已清理加密推理上下文，聊天记录已保留。")
-    expect(ui.toasts.at(-1)).toContain(reasons.refresh)
-    expect(ui.toasts.at(-1)).toContain(success.backupPath)
+    expect(ui.toasts.at(-1)).toBe(reasons.refresh)
+    expect(ui.toasts.join("\n")).not.toContain("备份")
     expect(ui.toasts.at(-1)).not.toContain("清理未完成：")
     expect(ui.toasts.at(-1)).not.toContain("private contents")
   })
@@ -159,7 +160,7 @@ describe("local slash wiring", () => {
     ui.reply.resolve(success)
     await ui.command.run()
     expect(ui.toasts[1]).toContain("已清理加密推理上下文，聊天记录已保留。")
-    expect(ui.toasts[1]).toContain(success.backupPath)
+    expect(ui.toasts[1]).not.toContain("备份")
     expect(ui.messages).toEqual([["invalidate", "ses_current"]])
     await ui.command.run()
     expect(ui.calls).toHaveLength(2)
@@ -191,7 +192,7 @@ async function server(configure: (ctx: ServerContext) => void = () => {}) {
   }
   const deps: Dependencies = {
     timeout: 1_000,
-    target: async () => { order.push("target"); return { dbPath: "/tmp/opencode/synthetic.db", backupDir: "/tmp/opencode/backups", bun: "/synthetic/bun" } },
+    target: async () => { order.push("target"); return { dbPath: "/tmp/opencode/synthetic.db", bun: "/synthetic/bun" } },
     helper: async (input) => { order.push("helper"); targets.push(input); return success },
   }
   configure(ctx)
@@ -217,7 +218,7 @@ describe("server RPC boundary", () => {
     expect(s.order).toEqual(["target", "get", "interrupt", "wait", "helper"])
     expect(s.targets).toEqual([
       { sessionID: "ses_current" }, { sessionID: "ses_current", resume: false }, { sessionID: "ses_current" },
-      { operation: "clear", sessionID: "ses_current", directory: "/tmp/opencode/current", dbPath: "/tmp/opencode/synthetic.db", backupDir: "/tmp/opencode/backups" },
+      { operation: "clear", sessionID: "ses_current", directory: "/tmp/opencode/current", dbPath: "/tmp/opencode/synthetic.db" },
     ])
   })
 
@@ -337,7 +338,7 @@ describe("database naming (pure, no database access)", () => {
 })
 
 describe("separate helper subprocess (mocked; no SQLite opened)", () => {
-  const input = { operation: "clear" as const, dbPath: "/tmp/opencode/synthetic.db", sessionID: "ses_current", directory: "/tmp/opencode/current", backupDir: "/tmp/opencode/backups" }
+  const input = { operation: "clear" as const, dbPath: "/tmp/opencode/synthetic.db", sessionID: "ses_current", directory: "/tmp/opencode/current" }
   function processMock(text: string, code = 0) {
     const writes: string[] = []
     const killed: unknown[] = []
@@ -364,6 +365,18 @@ describe("separate helper subprocess (mocked; no SQLite opened)", () => {
     } finally { p.spawn.mockRestore() }
   })
 
+  test("accepts committed nonzero counts without a backupPath", async () => {
+    const p = processMock('{"ok":true,"changedMessages":2,"changedEvents":3,"removedFields":4}')
+    try {
+      const task = runHelper(input, "/synthetic/bun", new AbortController().signal)
+      p.exit.resolve(0)
+      const result = await task
+      expect(result).toEqual(success)
+      expect(result).not.toHaveProperty("backupPath")
+      expect(p.killed).toEqual([])
+    } finally { p.spawn.mockRestore() }
+  })
+
   test("reported commit success wins a late cancellation", async () => {
     const p = processMock(JSON.stringify(success))
     try {
@@ -382,7 +395,8 @@ describe("separate helper subprocess (mocked; no SQLite opened)", () => {
       const task = runHelper(input, "/synthetic/bun", abort.signal)
       abort.abort()
       await expect(task).rejects.toThrow(reasons.cancelled)
-      expect(reasons.cancelled).toContain("检查备份和数据库状态")
+      expect(reasons.cancelled).toContain("检查数据库状态")
+      expect(reasons.cancelled).not.toContain("备份")
       expect(reasons.cancelled).not.toContain("未执行清理")
       expect(p.killed.length).toBeGreaterThan(0)
     } finally { p.spawn.mockRestore() }

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { createHash } from "node:crypto"
 import { constants } from "node:fs"
 import { access, readdir, realpath, stat } from "node:fs/promises"
 import os from "node:os"
@@ -19,8 +18,8 @@ export interface ServerContext {
   }
   rpc: { register(schema: typeof definition, handlers: { clear(input: unknown, call: Call): Promise<unknown> }): Promise<unknown> }
 }
-type Target = { dbPath: string; backupDir: string; bun: string }
-type HelperInput = { operation: "clear"; sessionID: string; directory: string; dbPath: string; backupDir: string }
+type Target = { dbPath: string; bun: string }
+type HelperInput = { operation: "clear"; sessionID: string; directory: string; dbPath: string }
 export interface Dependencies {
   target(channel: string): Promise<Target>
   helper(input: HelperInput, bun: string, signal: AbortSignal): Promise<ClearResult>
@@ -117,11 +116,8 @@ export async function resolveTarget(channel: string): Promise<Target> {
       } catch { return false }
     }))
     if (!open.some(Boolean)) throw new Error(reasons.database)
-    const state = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
-    if (!path.isAbsolute(state)) throw new Error(reasons.database)
-    const key = createHash("sha256").update(`${dbPath}\0${identity.dev}\0${identity.ino}`).digest("hex")
     const bun = await resolveRuntime()
-    return { dbPath, backupDir: path.join(state, "opencode", "clear-encrypted", key), bun }
+    return { dbPath, bun }
   } catch (error) {
     throw new Error(safeReason(error) === reasons.runtime ? reasons.runtime : reasons.database)
   }
@@ -143,8 +139,7 @@ export async function runHelper(input: HelperInput, bun: string, signal: AbortSi
     const result = JSON.parse(text)
     // A confirmed commit wins over cancellation racing with process exit.
     if (code === 0 && result?.ok === true
-      && [result.changedMessages, result.changedEvents, result.removedFields].every((x) => Number.isSafeInteger(x) && x >= 0)
-      && (result.removedFields === 0 || (typeof result.backupPath === "string" && path.isAbsolute(result.backupPath)))) return result
+      && [result.changedMessages, result.changedEvents, result.removedFields].every((x) => Number.isSafeInteger(x) && x >= 0)) return result
     throw new Error(reasons.helper)
   } catch {
     abort()
@@ -204,7 +199,7 @@ export async function setupServer(ctx: ServerContext, deps: Dependencies = { tar
         // No await between final abort check and helper launch. The helper independently
         // rechecks durable idle/location/identity inside its write transaction.
         return await deps.helper({ operation: "clear", sessionID, directory,
-          dbPath: target.dbPath, backupDir: target.backupDir }, target.bun, signal)
+          dbPath: target.dbPath }, target.bun, signal)
       } catch (error) {
         return call.error("failed", safeReason(error), null)
       } finally {

@@ -6,7 +6,6 @@ export type ClearResult = {
   changedMessages: number
   changedEvents: number
   removedFields: number
-  backupPath?: string
 }
 
 // Portable JSON schema: no SDK/runtime dependencies and no caller-selected paths.
@@ -27,7 +26,6 @@ export const definition = {
           changedMessages: { type: "integer", minimum: 0 },
           changedEvents: { type: "integer", minimum: 0 },
           removedFields: { type: "integer", minimum: 0 },
-          backupPath: { type: "string" },
         },
         required: ["ok", "changedMessages", "changedEvents", "removedFields"],
         additionalProperties: false,
@@ -46,10 +44,10 @@ export const reasons = {
   runtime: "独立 Bun 运行时不可用或不兼容，请在服务端将 OPENCODE_CLEAR_ENCRYPTED_BUN 设置为你信任的 Bun 可执行文件绝对路径",
   busy: "当前会话已有清理操作正在进行",
   stopped: "停止或等待会话结束失败，未执行清理",
-  cancelled: "操作已取消或超时；若已启动清理，请检查备份和数据库状态",
-  helper: "清理进程未确认成功，请检查备份和数据库状态",
+  cancelled: "操作已取消或超时；若已启动清理，请检查数据库状态",
+  helper: "清理进程未确认成功，请检查数据库状态",
   refresh: "清理已提交，但界面刷新失败；请重新打开会话",
-  unknown: "操作失败，请检查服务状态；若连接中断，请检查备份和数据库状态",
+  unknown: "操作失败，请检查服务状态；若连接中断，请检查数据库状态",
 } as const
 
 export function safeReason(error: unknown): string {
